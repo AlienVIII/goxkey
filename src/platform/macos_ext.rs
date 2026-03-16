@@ -1,7 +1,7 @@
 use cocoa::appkit::{
     NSApp, NSApplication, NSButton, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
 };
-use cocoa::base::{id, nil, YES};
+use cocoa::base::{id, nil, BOOL, NO, YES};
 use cocoa::foundation::{NSAutoreleasePool, NSString};
 use core_foundation::dictionary::CFDictionaryRef;
 use core_foundation::string::CFStringRef;
@@ -35,6 +35,7 @@ pub enum SystemTrayMenuItemKey {
     Enable,
     TypingMethodTelex,
     TypingMethodVNI,
+    TypingMethodTelexVNI,
     Exit,
 }
 
@@ -55,7 +56,8 @@ impl SystemTray {
             app.activateIgnoringOtherApps_(YES);
             let item = NSStatusBar::systemStatusBar(nil).statusItemWithLength_(-1.0);
             let title = NSString::alloc(nil).init_str("VN");
-            NSButton::setTitle_(item, title);
+            let button: id = msg_send![item, button];
+            let _: () = msg_send![button, setTitle: title];
             item.setMenu_(menu);
 
             let s = Self {
@@ -70,9 +72,10 @@ impl SystemTray {
 
     pub fn set_title(&mut self, title: &str) {
         unsafe {
-            let title = NSString::alloc(nil).init_str(title);
-            NSButton::setTitle_(self.item.0, title);
-            let _: () = msg_send![title, release];
+            let title_str = NSString::alloc(nil).init_str(title);
+            let button: id = msg_send![self.item.0, button];
+            let _: () = msg_send![button, setTitle: title_str];
+            let _: () = msg_send![title_str, release];
         }
     }
 
@@ -83,6 +86,7 @@ impl SystemTray {
         self.add_menu_separator();
         self.add_menu_item("Telex ✓", || ());
         self.add_menu_item("VNI", || ());
+        self.add_menu_item("Telex+VNI", || ());
         self.add_menu_separator();
         self.add_menu_item("Thoát ứng dụng", || ());
     }
@@ -117,7 +121,8 @@ impl SystemTray {
             SystemTrayMenuItemKey::Enable => 2,
             SystemTrayMenuItemKey::TypingMethodTelex => 4,
             SystemTrayMenuItemKey::TypingMethodVNI => 5,
-            SystemTrayMenuItemKey::Exit => 7,
+            SystemTrayMenuItemKey::TypingMethodTelexVNI => 6,
+            SystemTrayMenuItemKey::Exit => 8,
         }
     }
 
@@ -125,7 +130,9 @@ impl SystemTray {
         unsafe {
             let item_title = NSString::alloc(nil).init_str(label);
             let index = self.get_menu_item_index_by_key(key);
-            NSButton::setTitle_(self.menu.0.itemAtIndex_(index), item_title);
+            let menu_item: id = msg_send![self.menu.0, itemAtIndex: index];
+            let _: () = msg_send![menu_item, setTitle: item_title];
+            let _: () = msg_send![item_title, release];
         }
     }
 
@@ -347,6 +354,146 @@ extern "C" {
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
     pub static NSWorkspaceDidActivateApplicationNotification: CFStringRef;
+}
+
+// dispatch_get_main_queue() is a C macro expanding to (&_dispatch_main_q)
+extern "C" {
+    static _dispatch_main_q: c_void;
+    fn dispatch_async_f(
+        queue: *const c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
+}
+
+/// Open an app file picker deferred to the next run loop iteration.
+/// This avoids re-entering druid's RefCell borrow during event handling.
+pub fn defer_open_app_file_picker(callback: Box<dyn FnOnce(Option<String>) + Send>) {
+    unsafe extern "C" fn work(ctx: *mut c_void) {
+        let callback = Box::from_raw(ctx as *mut Box<dyn FnOnce(Option<String>) + Send>);
+        let name = open_app_file_picker();
+        callback(name);
+    }
+
+    let boxed: Box<Box<dyn FnOnce(Option<String>) + Send>> = Box::new(callback);
+    let ctx_ptr = Box::into_raw(boxed) as *mut c_void;
+
+    unsafe {
+        dispatch_async_f(&_dispatch_main_q, ctx_ptr, work);
+    }
+}
+
+pub fn open_app_file_picker() -> Option<String> {
+    unsafe {
+        let panel: id = msg_send![class!(NSOpenPanel), openPanel];
+        let _: () = msg_send![panel, setCanChooseFiles: YES];
+        let _: () = msg_send![panel, setCanChooseDirectories: NO];
+        let _: () = msg_send![panel, setAllowsMultipleSelection: NO as BOOL];
+
+        // Allow only .app bundles
+        let app_ext = NSString::alloc(nil).init_str("app");
+        let types_array: id = msg_send![class!(NSArray), arrayWithObject: app_ext];
+        let _: () = msg_send![panel, setAllowedFileTypes: types_array];
+
+        // Start in /Applications
+        let apps_path = NSString::alloc(nil).init_str("/Applications");
+        let dir_url: id = msg_send![class!(NSURL), fileURLWithPath: apps_path];
+        let _: () = msg_send![panel, setDirectoryURL: dir_url];
+
+        let response: i64 = msg_send![panel, runModal];
+        if response == 1 {
+            // NSModalResponseOK = 1
+            let url: id = msg_send![panel, URL];
+            let path: id = msg_send![url, path];
+
+            let utf8: *const std::ffi::c_char = msg_send![path, UTF8String];
+            if !utf8.is_null() {
+                return Some(
+                    std::ffi::CStr::from_ptr(utf8)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        None
+    }
+}
+
+pub fn open_text_file_picker() -> Option<String> {
+    unsafe {
+        let panel: id = msg_send![class!(NSOpenPanel), openPanel];
+        let _: () = msg_send![panel, setCanChooseFiles: YES];
+        let _: () = msg_send![panel, setCanChooseDirectories: NO];
+        let _: () = msg_send![panel, setAllowsMultipleSelection: NO as BOOL];
+
+        let response: i64 = msg_send![panel, runModal];
+        if response == 1 {
+            let url: id = msg_send![panel, URL];
+            let path: id = msg_send![url, path];
+            let utf8: *const std::ffi::c_char = msg_send![path, UTF8String];
+            if !utf8.is_null() {
+                return Some(
+                    std::ffi::CStr::from_ptr(utf8)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        None
+    }
+}
+
+pub fn save_text_file_picker() -> Option<String> {
+    unsafe {
+        let panel: id = msg_send![class!(NSSavePanel), savePanel];
+        let suggested_name = NSString::alloc(nil).init_str("expansions.txt");
+        let _: () = msg_send![panel, setNameFieldStringValue: suggested_name];
+
+        let response: i64 = msg_send![panel, runModal];
+        if response == 1 {
+            let url: id = msg_send![panel, URL];
+            let path: id = msg_send![url, path];
+            let utf8: *const std::ffi::c_char = msg_send![path, UTF8String];
+            if !utf8.is_null() {
+                return Some(
+                    std::ffi::CStr::from_ptr(utf8)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        None
+    }
+}
+
+pub fn defer_open_text_file_picker(callback: Box<dyn FnOnce(Option<String>) + Send>) {
+    unsafe extern "C" fn work(ctx: *mut c_void) {
+        let callback = Box::from_raw(ctx as *mut Box<dyn FnOnce(Option<String>) + Send>);
+        let path = open_text_file_picker();
+        callback(path);
+    }
+
+    let boxed: Box<Box<dyn FnOnce(Option<String>) + Send>> = Box::new(callback);
+    let ctx_ptr = Box::into_raw(boxed) as *mut c_void;
+
+    unsafe {
+        dispatch_async_f(&_dispatch_main_q, ctx_ptr, work);
+    }
+}
+
+pub fn defer_save_text_file_picker(callback: Box<dyn FnOnce(Option<String>) + Send>) {
+    unsafe extern "C" fn work(ctx: *mut c_void) {
+        let callback = Box::from_raw(ctx as *mut Box<dyn FnOnce(Option<String>) + Send>);
+        let path = save_text_file_picker();
+        callback(path);
+    }
+
+    let boxed: Box<Box<dyn FnOnce(Option<String>) + Send>> = Box::new(callback);
+    let ctx_ptr = Box::into_raw(boxed) as *mut c_void;
+
+    unsafe {
+        dispatch_async_f(&_dispatch_main_q, ctx_ptr, work);
+    }
 }
 
 pub fn add_app_change_callback<F>(cb: F)

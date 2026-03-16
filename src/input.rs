@@ -36,6 +36,70 @@ pub const PREDEFINED_CHARS: [char; 47] = [
 ];
 
 pub const STOP_TRACKING_WORDS: [&str; 4] = [";", "'", "?", "/"];
+/// In w-literal mode, replace standalone 'w' with placeholder bytes that the telex
+/// engine ignores (falls through to `_ => Transformation::Ignored`), then restore them
+/// after transformation. A 'w' is "standalone" when NOT preceded by a Horn/Breve-eligible
+/// vowel — those cases (uw→ư, ow→ơ, aw→ă) should still be handled by telex normally.
+enum CapPattern {
+    Lower,
+    TitleCase,
+    AllCaps,
+}
+
+fn detect_cap_pattern(s: &str) -> CapPattern {
+    let mut chars = s.chars().filter(|c| c.is_alphabetic());
+    match chars.next() {
+        Some(first) if first.is_uppercase() => {
+            if chars.all(|c| c.is_uppercase()) {
+                CapPattern::AllCaps
+            } else {
+                CapPattern::TitleCase
+            }
+        }
+        _ => CapPattern::Lower,
+    }
+}
+
+fn apply_cap_pattern(s: &str, pattern: CapPattern) -> String {
+    match pattern {
+        CapPattern::Lower => s.to_string(),
+        CapPattern::AllCaps => s.to_uppercase(),
+        CapPattern::TitleCase => {
+            let mut chars = s.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().to_string() + chars.as_str(),
+            }
+        }
+    }
+}
+
+fn mask_standalone_w(buffer: &str) -> String {
+    // Characters that can accept Horn (w) modification: u, o and all their toned forms.
+    // Characters that can accept Breve (w) modification: a and all its toned forms.
+    const HORN_BREVE_ELIGIBLE: &str =
+        "uoaUOA\u{01b0}\u{01a1}\u{0103}\
+         \u{00fa}\u{00f3}\u{00e1}\u{00f9}\u{00f2}\u{00e0}\
+         \u{1ee7}\u{1ecf}\u{1ea3}\u{0169}\u{00f5}\u{00e3}\u{1ecd}\u{1ea1}\
+         \u{00da}\u{00d3}\u{00c1}\u{00d9}\u{00d2}\u{00c0}\
+         \u{1ee6}\u{1ece}\u{1ea2}\u{0168}\u{00d5}\u{00c3}\u{1ecc}\u{1ea0}";
+    let chars: Vec<char> = buffer.chars().collect();
+    let mut result = String::with_capacity(buffer.len() + 4);
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == 'w' || ch == 'W' {
+            let preceded_by_eligible = i > 0 && HORN_BREVE_ELIGIBLE.contains(chars[i - 1]);
+            if preceded_by_eligible {
+                result.push(ch); // let telex transform it: uw→ư, ow→ơ, aw→ă
+            } else {
+                // Mask it — telex ignores \x01/\x02, we restore them after transform
+                result.push(if ch == 'w' { '\x01' } else { '\x02' });
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
 
 pub fn get_key_from_char(c: char) -> rdev::Key {
     use rdev::Key::*;
@@ -126,6 +190,7 @@ pub fn rebuild_keyboard_layout_map() {
 pub enum TypingMethod {
     VNI,
     Telex,
+    TelexVNI,
 }
 
 impl FromStr for TypingMethod {
@@ -134,6 +199,7 @@ impl FromStr for TypingMethod {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s.to_ascii_lowercase().as_str() {
             "vni" => TypingMethod::VNI,
+            "telexvni" => TypingMethod::TelexVNI,
             _ => TypingMethod::Telex,
         })
     }
@@ -147,6 +213,7 @@ impl Display for TypingMethod {
             match self {
                 Self::VNI => "vni",
                 Self::Telex => "telex",
+                Self::TelexVNI => "telexvni",
             }
         )
     }
@@ -162,11 +229,13 @@ pub struct InputState {
     previous_word: String,
     active_app: String,
     is_macro_enabled: bool,
+    is_macro_autocap_enabled: bool,
     macro_table: BTreeMap<String, String>,
     temporary_disabled: bool,
     previous_modifiers: KeyModifier,
     is_auto_toggle_enabled: bool,
     is_gox_mode_enabled: bool,
+    is_w_literal_enabled: bool,
 }
 
 impl InputState {
@@ -182,11 +251,13 @@ impl InputState {
             previous_word: String::new(),
             active_app: String::new(),
             is_macro_enabled: config.is_macro_enabled(),
+            is_macro_autocap_enabled: config.is_macro_autocap_enabled(),
             macro_table: config.get_macro_table().clone(),
             temporary_disabled: false,
             previous_modifiers: KeyModifier::empty(),
             is_auto_toggle_enabled: config.is_auto_toggle_enabled(),
             is_gox_mode_enabled: config.is_gox_mode_enabled(),
+            is_w_literal_enabled: config.is_w_literal_enabled(),
         }
     }
 
@@ -216,6 +287,18 @@ impl InputState {
         self.is_gox_mode_enabled
     }
 
+    pub fn is_w_literal_enabled(&self) -> bool {
+        self.is_w_literal_enabled
+    }
+
+    pub fn toggle_w_literal(&mut self) {
+        self.is_w_literal_enabled = !self.is_w_literal_enabled;
+        CONFIG_MANAGER
+            .lock()
+            .unwrap()
+            .set_w_literal_enabled(self.is_w_literal_enabled);
+    }
+
     pub fn is_enabled(&self) -> bool {
         !self.temporary_disabled && self.enabled
     }
@@ -238,11 +321,35 @@ impl InputState {
         self.should_track = true;
     }
 
-    pub fn get_macro_target(&self) -> Option<&String> {
+    pub fn get_macro_target(&self) -> Option<String> {
         if !self.is_macro_enabled {
             return None;
         }
-        self.macro_table.get(&self.display_buffer)
+        // Exact match
+        if let Some(target) = self.macro_table.get(&self.display_buffer) {
+            return Some(target.clone());
+        }
+        // Auto-capitalize: try lowercase lookup, then apply cap pattern
+        if self.is_macro_autocap_enabled {
+            let lower = self.display_buffer.to_lowercase();
+            if let Some(target) = self.macro_table.get(&lower) {
+                let pattern = detect_cap_pattern(&self.display_buffer);
+                return Some(apply_cap_pattern(target, pattern));
+            }
+        }
+        None
+    }
+
+    pub fn is_macro_autocap_enabled(&self) -> bool {
+        self.is_macro_autocap_enabled
+    }
+
+    pub fn toggle_macro_autocap(&mut self) {
+        self.is_macro_autocap_enabled = !self.is_macro_autocap_enabled;
+        CONFIG_MANAGER
+            .lock()
+            .unwrap()
+            .set_macro_autocap_enabled(self.is_macro_autocap_enabled);
     }
 
     pub fn get_typing_buffer(&self) -> &str {
@@ -268,6 +375,33 @@ impl InputState {
             config.add_english_app(&self.active_app);
         }
         self.new_word();
+    }
+
+    pub fn add_vietnamese_app(&mut self, app_name: &str) {
+        CONFIG_MANAGER.lock().unwrap().add_vietnamese_app(app_name);
+    }
+
+    pub fn add_english_app(&mut self, app_name: &str) {
+        CONFIG_MANAGER.lock().unwrap().add_english_app(app_name);
+    }
+
+    pub fn remove_vietnamese_app(&mut self, app_name: &str) {
+        CONFIG_MANAGER
+            .lock()
+            .unwrap()
+            .remove_vietnamese_app(app_name);
+    }
+
+    pub fn remove_english_app(&mut self, app_name: &str) {
+        CONFIG_MANAGER.lock().unwrap().remove_english_app(app_name);
+    }
+
+    pub fn get_vn_apps(&self) -> Vec<String> {
+        CONFIG_MANAGER.lock().unwrap().get_vn_apps()
+    }
+
+    pub fn get_en_apps(&self) -> Vec<String> {
+        CONFIG_MANAGER.lock().unwrap().get_en_apps()
     }
 
     pub fn set_method(&mut self, method: TypingMethod) {
@@ -339,18 +473,90 @@ impl InputState {
         self.macro_table.insert(from, to);
     }
 
+    pub fn export_macros_to_file(&self, path: &str) -> std::io::Result<()> {
+        use crate::config::build_kv_string;
+        use std::fs::File;
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        for (k, v) in &self.macro_table {
+            writeln!(file, "{}", build_kv_string(k, v))?;
+        }
+        Ok(())
+    }
+
+    pub fn import_macros_from_file(&mut self, path: &str) -> std::io::Result<usize> {
+        use crate::config::parse_kv_string;
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut count = 0;
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((from, to)) = parse_kv_string(line) {
+                self.add_macro(from, to);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn should_transform_keys(&self, c: &char) -> bool {
         self.enabled
     }
 
     pub fn transform_keys(&self) -> Result<(String, TransformResult), ()> {
-        let transform_method = match self.method {
-            TypingMethod::VNI => vi::vni::transform_buffer,
-            TypingMethod::Telex => vi::telex::transform_buffer,
+        // In w-literal mode (Telex only), replace standalone 'w' with a placeholder
+        // before feeding to the telex engine, then restore it in the output.
+        // A 'w' is considered standalone if NOT preceded by a Horn/Breve-eligible vowel
+        // (u, o for Horn; a for Breve). This preserves uw→ư, ow→ơ, aw→ă etc.
+        let effective_buffer = if self.is_w_literal_enabled
+            && matches!(self.method, TypingMethod::Telex | TypingMethod::TelexVNI)
+        {
+            mask_standalone_w(&self.buffer)
+        } else {
+            self.buffer.clone()
         };
-        let result = std::panic::catch_unwind(|| {
+
+        if self.method == TypingMethod::TelexVNI {
+            // Try both methods; prefer VNI when the buffer contains digits
+            // (VNI's key differentiator), otherwise fall back to Telex.
+            let buffer = effective_buffer;
+            let result = std::panic::catch_unwind(move || {
+                let has_digits = buffer.chars().any(|c| c.is_ascii_digit());
+                if has_digits {
+                    let mut output = String::new();
+                    let transform_result = vi::vni::transform_buffer(buffer.chars(), &mut output);
+                    (output, transform_result)
+                } else {
+                    let mut output = String::new();
+                    let transform_result = vi::telex::transform_buffer(buffer.chars(), &mut output);
+                    let output = output.replace('\x01', "w").replace('\x02', "W");
+                    (output, transform_result)
+                }
+            });
+            return result.map_err(|_| ());
+        }
+
+        let method = self.method;
+        let buffer = effective_buffer;
+        let is_w_literal = self.is_w_literal_enabled;
+        let result = std::panic::catch_unwind(move || {
             let mut output = String::new();
-            let transform_result = transform_method(self.buffer.chars(), &mut output);
+            let transform_result = match method {
+                TypingMethod::VNI => vi::vni::transform_buffer(buffer.chars(), &mut output),
+                TypingMethod::Telex | TypingMethod::TelexVNI => vi::telex::transform_buffer(buffer.chars(), &mut output),
+            };
+            // Restore masked standalone w's back to literal 'w'/'W'
+            let output = if is_w_literal {
+                output.replace('\x01', "w").replace('\x02', "W")
+            } else {
+                output
+            };
             (output, transform_result)
         });
         if let Ok((output, transform_result)) = result {
@@ -376,10 +582,6 @@ impl InputState {
             dp_len - 1
         };
 
-        // Add an extra backspace to compensate the initial text selection deletion.
-        // This is useful in applications like chrome, where the URL bar uses text selection
-        // for autocompletion, causing the first backspace to delete the selection instead of
-        // the character behind the cursor.
         if is_in_text_selection() {
             backspace_count + 1
         } else {
@@ -434,17 +636,11 @@ impl InputState {
         STOP_TRACKING_WORDS.contains(&self.previous_word.as_str())
     }
 
-    // a set of rules that will trigger a hard stop for tracking
-    // maybe these weird stuff should not be here, but let's
-    // implement it anyway. we'll figure out where to put these
-    // later on.
     pub fn should_stop_tracking(&mut self) -> bool {
         let len = self.buffer.len();
         if len > MAX_POSSIBLE_WORD_LENGTH {
             return true;
         }
-        // detect attempts to restore a word
-        // by doubling tone marks like ss, rr, ff, jj, xx
         let buf = &self.buffer;
         if TONE_DUPLICATE_PATTERNS
             .iter()

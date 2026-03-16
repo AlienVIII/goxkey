@@ -2,8 +2,8 @@
 	<img src="./icons/icon.png" width="90px">
 </p>
 
----
-<img width="432" alt="image" align="right" src="https://github.com/huytd/goxkey/assets/613943/2a65372b-e27f-4b7f-914c-7f2b5c8484fd">
+
+<img width="1585" height="797" alt="screenshots" src="https://github.com/user-attachments/assets/42930e8a-77fb-4493-aa90-3c0bb9f1ab40" />
 
 
 **Gõkey** - A Vietnamese input method editor.

@@ -20,9 +20,11 @@ pub struct ConfigStore {
     vn_apps: Vec<String>,
     en_apps: Vec<String>,
     is_macro_enabled: bool,
+    is_macro_autocap_enabled: bool,
     macro_table: BTreeMap<String, String>,
     is_auto_toggle_enabled: bool,
     is_gox_mode_enabled: bool,
+    is_w_literal_enabled: bool,
     allowed_words: Vec<String>,
 }
 
@@ -33,7 +35,7 @@ fn parse_vec_string(line: String) -> Vec<String> {
         .collect()
 }
 
-fn parse_kv_string(line: &str) -> Option<(String, String)> {
+pub(crate) fn parse_kv_string(line: &str) -> Option<(String, String)> {
     if let Some((left, right)) = line.split_once("\"=\"") {
         let left = left.strip_prefix("\"").map(|s| s.replace("\\\"", "\""));
         let right = right.strip_suffix("\"").map(|s| s.replace("\\\"", "\""));
@@ -42,7 +44,7 @@ fn parse_kv_string(line: &str) -> Option<(String, String)> {
     return None;
 }
 
-fn build_kv_string(k: &str, v: &str) -> String {
+pub(crate) fn build_kv_string(k: &str, v: &str) -> String {
     format!(
         "\"{}\"=\"{}\"",
         k.replace("\"", "\\\""),
@@ -80,6 +82,11 @@ impl ConfigStore {
             "{} = {}",
             MACRO_ENABLED_CONFIG_KEY, self.is_macro_enabled
         )?;
+        writeln!(
+            file,
+            "{} = {}",
+            MACRO_AUTOCAP_ENABLED_CONFIG_KEY, self.is_macro_autocap_enabled
+        )?;
         for (k, v) in self.macro_table.iter() {
             writeln!(file, "{} = {}", MACROS_CONFIG_KEY, build_kv_string(k, &v))?;
         }
@@ -87,6 +94,11 @@ impl ConfigStore {
             file,
             "{} = {}",
             GOX_MODE_CONFIG_KEY, self.is_gox_mode_enabled
+        )?;
+        writeln!(
+            file,
+            "{} = {}",
+            W_LITERAL_CONFIG_KEY, self.is_w_literal_enabled
         )?;
         Ok(())
     }
@@ -98,9 +110,11 @@ impl ConfigStore {
             vn_apps: Vec::new(),
             en_apps: Vec::new(),
             is_macro_enabled: false,
+            is_macro_autocap_enabled: false,
             macro_table: BTreeMap::new(),
             is_auto_toggle_enabled: false,
             is_gox_mode_enabled: false,
+            is_w_literal_enabled: false,
             allowed_words: vec!["đc".to_string()],
         };
 
@@ -124,6 +138,9 @@ impl ConfigStore {
                         MACRO_ENABLED_CONFIG_KEY => {
                             config.is_macro_enabled = matches!(right.trim(), "true")
                         }
+                        MACRO_AUTOCAP_ENABLED_CONFIG_KEY => {
+                            config.is_macro_autocap_enabled = matches!(right.trim(), "true")
+                        }
                         MACROS_CONFIG_KEY => {
                             if let Some((k, v)) = parse_kv_string(right) {
                                 config.macro_table.insert(k, v);
@@ -131,6 +148,9 @@ impl ConfigStore {
                         }
                         GOX_MODE_CONFIG_KEY => {
                             config.is_gox_mode_enabled = matches!(right.trim(), "true")
+                        }
+                        W_LITERAL_CONFIG_KEY => {
+                            config.is_w_literal_enabled = matches!(right.trim(), "true")
                         }
                         _ => {}
                     }
@@ -169,21 +189,41 @@ impl ConfigStore {
         self.en_apps.contains(&app_name.to_string())
     }
 
+    pub fn get_vn_apps(&self) -> Vec<String> {
+        self.vn_apps.clone()
+    }
+
+    pub fn get_en_apps(&self) -> Vec<String> {
+        self.en_apps.clone()
+    }
+
     pub fn add_vietnamese_app(&mut self, app_name: &str) {
         if self.is_english_app(app_name) {
-            // Remove from english apps
             self.en_apps.retain(|x| x != app_name);
         }
-        self.vn_apps.push(app_name.to_string());
+        if !self.is_vietnamese_app(app_name) {
+            self.vn_apps.push(app_name.to_string());
+        }
         self.save();
     }
 
     pub fn add_english_app(&mut self, app_name: &str) {
         if self.is_vietnamese_app(app_name) {
-            // Remove from vietnamese apps
             self.vn_apps.retain(|x| x != app_name);
         }
-        self.en_apps.push(app_name.to_string());
+        if !self.is_english_app(app_name) {
+            self.en_apps.push(app_name.to_string());
+        }
+        self.save();
+    }
+
+    pub fn remove_vietnamese_app(&mut self, app_name: &str) {
+        self.vn_apps.retain(|x| x != app_name);
+        self.save();
+    }
+
+    pub fn remove_english_app(&mut self, app_name: &str) {
+        self.en_apps.retain(|x| x != app_name);
         self.save();
     }
 
@@ -209,12 +249,30 @@ impl ConfigStore {
         self.save();
     }
 
+    pub fn is_w_literal_enabled(&self) -> bool {
+        self.is_w_literal_enabled
+    }
+
+    pub fn set_w_literal_enabled(&mut self, flag: bool) {
+        self.is_w_literal_enabled = flag;
+        self.save();
+    }
+
     pub fn is_macro_enabled(&self) -> bool {
         self.is_macro_enabled
     }
 
     pub fn set_macro_enabled(&mut self, flag: bool) {
         self.is_macro_enabled = flag;
+        self.save();
+    }
+
+    pub fn is_macro_autocap_enabled(&self) -> bool {
+        self.is_macro_autocap_enabled
+    }
+
+    pub fn set_macro_autocap_enabled(&mut self, flag: bool) {
+        self.is_macro_autocap_enabled = flag;
         self.save();
     }
 
@@ -243,7 +301,9 @@ const TYPING_METHOD_CONFIG_KEY: &str = "method";
 const VN_APPS_CONFIG_KEY: &str = "vn-apps";
 const EN_APPS_CONFIG_KEY: &str = "en-apps";
 const MACRO_ENABLED_CONFIG_KEY: &str = "is_macro_enabled";
+const MACRO_AUTOCAP_ENABLED_CONFIG_KEY: &str = "is_macro_autocap_enabled";
 const AUTOS_TOGGLE_ENABLED_CONFIG_KEY: &str = "is_auto_toggle_enabled";
 const MACROS_CONFIG_KEY: &str = "macros";
 const GOX_MODE_CONFIG_KEY: &str = "is_gox_mode_enabled";
+const W_LITERAL_CONFIG_KEY: &str = "is_w_literal_enabled";
 const ALLOWED_WORDS_CONFIG_KEY: &str = "allowed_words";

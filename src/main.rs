@@ -123,7 +123,9 @@ fn do_macro_replace(handle: Handle, target: &String) {
 unsafe fn toggle_vietnamese() {
     INPUT_STATE.toggle_vietnamese();
     if let Some(event_sink) = UI_EVENT_SINK.get() {
-        _ = event_sink.submit_command(UPDATE_UI, (), Target::Auto);
+        if let Err(e) = event_sink.submit_command(UPDATE_UI, (), Target::Auto) {
+            debug!("Failed to submit UPDATE_UI command: {:?}", e);
+        }
     }
 }
 
@@ -136,7 +138,9 @@ unsafe fn auto_toggle_vietnamese() {
         return;
     }
     if let Some(event_sink) = UI_EVENT_SINK.get() {
-        _ = event_sink.submit_command(UPDATE_UI, (), Target::Auto);
+        if let Err(e) = event_sink.submit_command(UPDATE_UI, (), Target::Auto) {
+            debug!("Failed to submit UPDATE_UI command: {:?}", e);
+        }
     }
 }
 
@@ -215,7 +219,7 @@ fn event_handler(
                                     if keycode == KEY_TAB || keycode == KEY_SPACE {
                                         if let Some(macro_target) = INPUT_STATE.get_macro_target() {
                                             debug!("Macro: {}", macro_target);
-                                            do_macro_replace(handle, macro_target)
+                                            do_macro_replace(handle, &macro_target)
                                         }
                                     }
 
